@@ -1,0 +1,10 @@
+version: '3.9'
+services:
+  anima-rfpar:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.serve
+    env_file:
+      - .env.serve.example
+    ports:
+      - "8000:8000"

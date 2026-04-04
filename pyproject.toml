@@ -1,0 +1,28 @@
+[project]
+name = "anima-rfpar"
+version = "0.1.0"
+description = "ANIMA scaffold for RFPAR (RL-based black-box pixel attack research module)"
+readme = "PRD.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+  "numpy>=1.26",
+  "pillow>=10.0",
+]
+
+[project.optional-dependencies]
+ml = [
+  "torch>=2.3",
+  "torchvision>=0.18",
+  "ultralytics>=8.2",
+]
+dev = [
+  "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[build-system]
+requires = ["hatchling>=1.24.0"]
+build-backend = "hatchling.build"

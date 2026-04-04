@@ -1,0 +1,11 @@
+id: DEF-rfpar
+name: Remember and Forget Pixel Attack using RL
+version: 0.1.0
+runtime:
+  python: "3.11"
+  entrypoint: "python -m anima_rfpar.cli"
+interfaces:
+  inputs: []
+  outputs: []
+notes:
+  - "Scaffold manifest; populate ROS2/API interface contracts in PRD-06."

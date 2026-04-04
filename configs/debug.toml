@@ -1,0 +1,23 @@
+[module]
+name = "DEF-rfpar"
+seed = 123
+
+[execution]
+backend = "cpu"
+mode = "classification"
+dry_run = true
+output_dir = "outputs/debug"
+
+[paths]
+reference_repo = "repositories/RFPAR"
+imagenet_root = "repositories/RFPAR/ImageNet"
+coco_root = "repositories/RFPAR/COCO/images/val"
+argoverse_root = "/tmp/argoverse-missing"
+
+[attack]
+max_iterations = 3
+bound_threshold_eta = 0.05
+alpha = 0.01
+convergence_duration_t = 2
+query_budget = 30
+yolo_conf_threshold = 0.5

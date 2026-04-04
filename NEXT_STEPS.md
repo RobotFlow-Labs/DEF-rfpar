@@ -1,54 +1,40 @@
-# NEXT_STEPS — DEF-rfpar: Remember & Forget Pixel Attack using RL
+# NEXT_STEPS — DEF-rfpar (RFPAR)
 ## Last Updated: 2026-04-04
-## Status: DOCUMENTATION COMPLETE — Ready for implementation
-## MVP Readiness: 15% (documentation), 0% (code)
+## Status: PRD + TASK + SCAFFOLD COMPLETE
+## MVP Readiness: 35% (planning+scaffold), 0% (baseline parity), 0% (kernel optimization)
 
-## What Was Completed This Session
+## Completed in this Session
 
-✅ **CLAUDE.md** — Paper enriched with arxiv 2502.07821 (RL pixel attacks)
-✅ **tasks/README.md** — 10 actionable PRD tasks
-✅ **kernels/README.md** — 3 CUDA kernel specifications
-✅ **benchmarks/README.md** — Paper metrics + implementation targets
+- Generated full module asset manifest from local paper/repo + online references.
+- Generated full top-level PRD and the 7-PRD suite.
+- Re-sliced build work into granular task files with dependency order.
+- Scaffolded executable package under `src/anima_rfpar/`.
+- Added config profiles (`default`, `paper`, `debug`) and baseline tests.
+- Added service/docker/ros2/docs/reports placeholders to unblock later PRDs.
 
-## Implementation Phases (Est. 68 hours total)
+## Current Build Frontier
 
-| Phase | Tasks | Hours | Status |
-|-------|-------|-------|--------|
-| 1. Environment & Baseline | PRD-001, 002 | 14h | TODO |
-| 2. RL Environment | PRD-003, 004 | 18h | TODO |
-| 3. CUDA Kernels | PRD-005, 006 | 18h | TODO |
-| 4. MLX Port & Dual-Compute | PRD-007 | 14h | TODO |
-| 5. Query Optimization | PRD-008 | 6h | TODO |
-| 6. Edge Deployment | PRD-009 | 12h | TODO |
-| 7. Benchmarking | PRD-010 | 6h | TODO |
+Focus on **PRD-01** and **PRD-02** execution:
 
-## Immediate Next Actions (Phase 1)
-
-**Environment Setup**:
-- [ ] Clone https://github.com/KAU-QuantumAILab/RFPAR
-- [ ] Run `uv sync` (RL environment, gym)
-- [ ] Download datasets (46.5GB total):
-  - ImageNet-1K validation (50K, 6.5GB)
-  - Argoverse (autonomous driving, 40GB)
-
-**Baseline**:
-- [ ] Load YOLOv8 model
-- [ ] Measure mAP on Argoverse
-- [ ] Profile baseline attack latency
-
-## Models/Datasets
-
-| Item | Size | Location |
-|------|------|----------|
-| ImageNet-1K | 6.5GB | `/mnt/forge-data/.../imagenet1k/` |
-| Argoverse | 40GB | `/mnt/forge-data/.../argoverse/` |
-| YOLOv8 | 100-200MB | Ultralytics |
+- [ ] Create `uv` environment with Python 3.11
+- [ ] PRD-0101 — bootstrap and dependency lock with `uv`
+- [ ] PRD-0102 — validate config loading against all profiles
+- [ ] PRD-0103 — harden dataset contract checks for real dataset layouts
+- [ ] PRD-0104 — run and fix baseline tests
+- [ ] PRD-0201 — wire real reference module loading and smoke import checks
+- [ ] PRD-0202 — implement first executable Remember/Forget loop using reference logic
 
 ## Blockers
-None — ready to start.
 
-## Key Paper Results
-- Attack success: 95%+ with <100 pixels (<1% of image)
-- Query efficiency: 30-40% reduction vs baseline
-- mAP reduction: 50-70% on Argoverse
-- Transferability: 75%+ to unseen models
+- Production-scale datasets are not available locally (Argoverse missing).
+- DDQ stack is not wired into current scaffold yet.
+
+## Key Paths
+
+- PRD root: `PRD.md`
+- PRD suite: `prds/`
+- Task index: `tasks/INDEX.md`
+- Package scaffold: `src/anima_rfpar/`
+- Configs: `configs/`
+- Paper: `papers/2502.07821.pdf`
+- Reference implementation: `repositories/RFPAR/`
