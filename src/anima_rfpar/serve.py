@@ -10,7 +10,6 @@ import torch
 from PIL import Image
 
 from .agent import REINFORCEAgent
-from .export import load_agent_from_checkpoint
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +33,7 @@ class RFPARNode:
             logger.warning(f"Checkpoint not found: {ckpt_path}")
             return
 
+        # weights_only=False required: checkpoint contains config dicts alongside state_dict
         ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
         config = ckpt.get("config", {})
         self.detector_mode = config.get("mode", "classification") == "detection"

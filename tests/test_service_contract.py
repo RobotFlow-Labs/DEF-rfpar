@@ -1,4 +1,4 @@
-from anima_rfpar.service.app import health, ready
+from anima_rfpar.service.app import app, health, node, ready
 
 
 def test_health_contract() -> None:
@@ -9,9 +9,7 @@ def test_health_contract() -> None:
 
 def test_ready_contract() -> None:
     resp = ready()
-    # Without weights loaded, returns JSONResponse (503) or dict
     if hasattr(resp, "body"):
-        # JSONResponse case — weights not loaded
         import json
 
         data = json.loads(resp.body)

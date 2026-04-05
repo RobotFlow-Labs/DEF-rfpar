@@ -19,6 +19,7 @@ def load_agent_from_checkpoint(
     channels: int = 3,
     detector_mode: bool = False,
 ) -> REINFORCEAgent:
+    # weights_only=False required: checkpoint contains config dicts alongside state_dict
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     agent = REINFORCEAgent(
         img_h=img_h, img_w=img_w, channels=channels, detector_mode=detector_mode
@@ -41,6 +42,8 @@ def export_safetensors(agent: REINFORCEAgent, output_path: Path) -> Path:
 def export_onnx(
     agent: REINFORCEAgent, output_path: Path, img_h: int = 224, img_w: int = 224
 ) -> Path:
+    import onnx
+
     onnx_path = output_path / "agent.onnx"
     dummy = torch.randn(1, 3, img_h, img_w)
     torch.onnx.export(
@@ -49,9 +52,11 @@ def export_onnx(
         str(onnx_path),
         input_names=["image"],
         output_names=["action_mean", "action_std"],
-        dynamic_axes={"image": {0: "batch"}, "action_mean": {0: "batch"}, "action_std": {0: "batch"}},
-        opset_version=17,
+        opset_version=18,
     )
+    # Ensure weights are embedded (not external) for TRT compatibility
+    model = onnx.load(str(onnx_path))
+    onnx.save(model, str(onnx_path), save_as_external_data=False)
     logger.info(f"Exported ONNX: {onnx_path}")
     return onnx_path
 
@@ -83,7 +88,9 @@ def export_trt(onnx_path: Path, output_path: Path) -> tuple[Path | None, Path | 
                     fp16_path = out
                 else:
                     fp32_path = out
-            except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as e:
+            except (
+                subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired
+            ) as e:
                 logger.warning(f"TRT {precision} export failed: {e}")
                 # Fallback: try trtexec directly
                 try:

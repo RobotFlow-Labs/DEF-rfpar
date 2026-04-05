@@ -57,10 +57,16 @@ def _early_stopping(delta: float, stop_count: int, limit: float, patience: int):
     return 0, False
 
 
+_IMAGENET_MEAN: torch.Tensor | None = None
+_IMAGENET_STD: torch.Tensor | None = None
+
+
 def _normalize_imagenet(x: torch.Tensor, device: torch.device) -> torch.Tensor:
-    mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
-    return (x - mean) / std
+    global _IMAGENET_MEAN, _IMAGENET_STD
+    if _IMAGENET_MEAN is None or _IMAGENET_MEAN.device != device:
+        _IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+        _IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+    return (x - _IMAGENET_MEAN) / _IMAGENET_STD
 
 
 def _sample_action(means, stds, n_pixels, device):
@@ -149,15 +155,15 @@ def run_classification_attack(
     metric_images = images.clone().to(device)
     idx_list = torch.arange(N, device=device)
     init_ori_prob: list[torch.Tensor] = []
-    ori_prob = None
 
     total_deceived = 0
     L0: list[float] = []
     L2: list[float] = []
-    it_list: list[int] = []
     query_count = 0
     save_labels = torch.zeros(N)
-    i = 0
+    remember_step = 0
+    ori_prob_full = torch.tensor([], device=device)
+    update_rewards = torch.zeros(update_images.shape[0], device=device)
 
     logger.info(
         f"[RFPAR-CLS] N={N}, pixels={n_pixels}, alpha={alpha}, "
@@ -190,7 +196,7 @@ def run_classification_attack(
             loader = torch.utils.data.DataLoader(
                 train_data, batch_size=batch_size, shuffle=False
             )
-            i += 1
+            remember_step += 1
 
             train_x_parts = []
             train_y_parts = []
@@ -249,7 +255,6 @@ def run_classification_attack(
                     idx_list[batch_size * bt : batch_size * bt + len(lbl)][change_list == 1]
                 )
                 succes_labels_list.append(changed_preds_idx[change_list == 1])
-                it_list.extend([i] * int(change_list.sum().item()))
 
                 change_train_x_parts.append(changed.to(device))
                 total_change_list = torch.cat(
@@ -299,7 +304,7 @@ def run_classification_attack(
             total_rewards_t = torch.tensor(total_rewards_list, device=device)[mask]
             stacked = torch.stack([update_rewards, total_rewards_t], dim=0)
             best_idx = torch.max(stacked, axis=0).indices
-            arange = torch.arange(total_rewards_t.shape[0])
+            arange = torch.arange(total_rewards_t.shape[0], device=device)
             update_rewards = stacked[best_idx, arange]
 
             update_rewards_sum = update_rewards.mean() + total_change_list.sum()
@@ -546,8 +551,14 @@ def run_detection_attack(
                             torch.bincount(lab_cpu).shape[0] if lab_cpu.numel() > 0 else 1,
                             torch.bincount(cls_cpu).shape[0] if cls_cpu.numel() > 0 else 1,
                         )
-                        orig_bc = torch.bincount(lab_cpu, minlength=sz) if lab_cpu.numel() > 0 else torch.zeros(sz)
-                        new_bc = torch.bincount(cls_cpu, minlength=sz) if cls_cpu.numel() > 0 else torch.zeros(sz)
+                        orig_bc = (
+                            torch.bincount(lab_cpu, minlength=sz)
+                            if lab_cpu.numel() > 0 else torch.zeros(sz)
+                        )
+                        new_bc = (
+                            torch.bincount(cls_cpu, minlength=sz)
+                            if cls_cpu.numel() > 0 else torch.zeros(sz)
+                        )
                         temp = orig_bc - new_bc
                         dif = temp.sum()
                         dif_list.append(dif)
@@ -560,14 +571,21 @@ def run_detection_attack(
 
                         if (temp != 0).any():
                             for j in range(len(temp)):
-                                if temp[j] > 0:
-                                    add = torch.full((int(temp[j]),), j, dtype=torch.long, device=device)
-                                    cls_i = torch.cat((cls_i.long().to(device), add))
-                                    plist_i = torch.cat((plist_i.to(device), torch.zeros(int(temp[j]), device=device)))
-                                elif temp[j] < 0:
-                                    add = torch.full((int(-temp[j]),), j, dtype=torch.long, device=device)
-                                    lab_i = torch.cat((lab_i.long().to(device), add))
-                                    prob_i = torch.cat((prob_i.to(device), torch.zeros(int(-temp[j]), device=device)))
+                                cnt = int(temp[j])
+                                if cnt > 0:
+                                    pad = torch.full(
+                                        (cnt,), j, dtype=torch.long, device=device
+                                    )
+                                    cls_i = torch.cat((cls_i.long().to(device), pad))
+                                    zeros = torch.zeros(cnt, device=device)
+                                    plist_i = torch.cat((plist_i.to(device), zeros))
+                                elif cnt < 0:
+                                    pad = torch.full(
+                                        (-cnt,), j, dtype=torch.long, device=device
+                                    )
+                                    lab_i = torch.cat((lab_i.long().to(device), pad))
+                                    zeros = torch.zeros(-cnt, device=device)
+                                    prob_i = torch.cat((prob_i.to(device), zeros))
 
                         reward = (
                             prob_i[lab_i.sort()[1]].cpu() - plist_i[cls_i.sort()[1]].cpu()

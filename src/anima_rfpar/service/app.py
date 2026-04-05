@@ -3,21 +3,25 @@ from __future__ import annotations
 
 import os
 import time
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse
 
 from ..serve import RFPARNode
 
-app = FastAPI(title="anima-rfpar", version="0.1.0")
 node = RFPARNode()
 _start_time = time.time()
 
 
-@app.on_event("startup")
-def startup():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     ckpt = os.environ.get("ANIMA_WEIGHT_DIR", "/data/weights") + "/best.pth"
     node.setup_inference(ckpt)
+    yield
+
+
+app = FastAPI(title="anima-rfpar", version="0.1.0", lifespan=lifespan)
 
 
 @app.get("/health")
@@ -57,6 +61,6 @@ def info() -> dict:
 
 
 @app.post("/predict")
-async def predict(file: UploadFile = File(...)) -> dict:
+async def predict(file: UploadFile = File(...)) -> dict:  # noqa: B008
     image_bytes = await file.read()
     return node.predict(image_bytes)

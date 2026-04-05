@@ -7,7 +7,6 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.distributions as dist
 
 
 class REINFORCEAgent(nn.Module):
@@ -58,28 +57,3 @@ class REINFORCEAgent(nn.Module):
         loss.backward()
         self.optimizer.step()
         return loss.item()
-
-
-def sample_actions(
-    means: torch.Tensor,
-    stds: torch.Tensor,
-    n_pixels: int,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Sample pixel perturbation actions from Gaussian policy.
-
-    Returns:
-        actions: (n_pixels, batch, 5) if n_pixels > 1, else (batch, 5)
-        log_probs: corresponding log probabilities
-    """
-    stds = torch.clamp(stds, 0.1, 10)
-    cov = torch.diag_embed(stds.pow(2))
-    distribution = dist.MultivariateNormal(means, cov)
-
-    if n_pixels == 1:
-        actions = distribution.sample()
-    else:
-        actions = distribution.sample((n_pixels,))
-
-    log_probs = distribution.log_prob(actions)
-    return actions, log_probs
