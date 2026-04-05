@@ -2,21 +2,23 @@
 
 Classification attack on ImageNet with ResNeXt50.
 Detection attack on COCO with YOLO.
+Closely follows reference: github.com/KAU-QuantumAILab/RFPAR
 """
 from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import numpy as np
 import torch
+import torch.distributions as dist
 from PIL import Image
 
-from .agent import REINFORCEAgent, sample_actions
-from .environment import ClassificationEnv, DetectionEnv
+from .agent import REINFORCEAgent
 
 logger = logging.getLogger(__name__)
 
@@ -38,34 +40,76 @@ class AttackMetrics:
 class AttackResult:
     metrics: AttackMetrics = field(default_factory=AttackMetrics)
     agent_state: dict | None = None
-    adv_images: list = field(default_factory=list)
 
 
-def _l0_norm(orig: torch.Tensor, changed: torch.Tensor) -> float:
-    return torch.count_nonzero(orig - changed).item()
+def _l0_norm(a: torch.Tensor, b: torch.Tensor) -> list[float]:
+    return [torch.count_nonzero(a - b).cpu().item()]
 
 
-def _l2_norm(orig: torch.Tensor, changed: torch.Tensor) -> float:
-    return torch.norm((orig.float() - changed.float()), p=2).item()
+def _l2_norm(a: torch.Tensor, b: torch.Tensor) -> list[float]:
+    return [torch.norm((a.float() - b.float()), p=2).cpu().item()]
 
 
 def _early_stopping(delta: float, stop_count: int, limit: float, patience: int):
     if delta <= limit:
         stop_count += 1
-        if stop_count >= patience:
-            return stop_count, True
+        return stop_count, stop_count >= patience
+    return 0, False
+
+
+def _normalize_imagenet(x: torch.Tensor, device: torch.device) -> torch.Tensor:
+    mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+    return (x - mean) / std
+
+
+def _sample_action(means, stds, n_pixels, device):
+    stds = torch.clamp(stds, 0.1, 10)
+    cov = torch.diag_embed(stds.pow(2)).to(device)
+    distribution = dist.MultivariateNormal(means, cov)
+    if n_pixels == 1:
+        actions = distribution.sample()
     else:
-        stop_count = 0
-    return stop_count, False
+        actions = distribution.sample((n_pixels,))
+    log_probs = distribution.log_prob(actions)
+    return actions, log_probs
 
 
-class MyDataset(torch.utils.data.Dataset):
-    def __init__(self, x_data, y_data):
-        self.x_data = x_data
-        self.y_data = y_data
+def _make_transformed_cls(original_images, actions, n_pixels):
+    """Apply pixel perturbations for classification (values in [0,1])."""
+    dev = original_images.device
+    B, C, H, W = original_images.shape
+    actions = torch.sigmoid(actions)
+    x = (actions[:, 0] * H - 1).long().clamp(0, H - 1)
+    y = (actions[:, 1] * W - 1).long().clamp(0, W - 1)
+    r = (actions[:, 2] > 0.5).float()
+    g = (actions[:, 3] > 0.5).float()
+    b = (actions[:, 4] > 0.5).float()
 
-    def __getitem__(self, idx):
-        return self.x_data[idx], self.y_data[idx]
+    arr = []
+    for i in range(B):
+        changed = original_images[i].clone()
+        if n_pixels == 1:
+            changed[0, x[i], y[i]] = r[i]
+            changed[1, x[i], y[i]] = g[i]
+            changed[2, x[i], y[i]] = b[i]
+        else:
+            idx = (torch.arange(n_pixels, device=dev) * B + i)
+            idx = idx[idx < len(x)]
+            changed[0, x[idx], y[idx]] = r[idx]
+            changed[1, x[idx], y[idx]] = g[idx]
+            changed[2, x[idx], y[idx]] = b[idx]
+        arr.append(changed.unsqueeze(0))
+    return torch.cat(arr, 0)
+
+
+class _Dataset(torch.utils.data.Dataset):
+    def __init__(self, x, y):
+        self.x_data = x
+        self.y_data = y
+
+    def __getitem__(self, i):
+        return self.x_data[i], self.y_data[i]
 
     def __len__(self):
         return self.x_data.shape[0]
@@ -85,26 +129,11 @@ def run_classification_attack(
     lr: float = 1e-4,
     seed: int = 2,
 ) -> AttackResult:
-    """Run RFPAR classification attack (Remember & Forget loop).
-
-    Args:
-        model: victim classifier (eval mode)
-        images: (N, C, H, W) normalized to [0, 1]
-        labels: (N,) ground truth labels
-        device: CUDA device
-        output_dir: save adversarial images here
-        max_iterations: max Forget iterations (paper: 100)
-        alpha: pixel ratio (paper: 0.01 for classification)
-        patience: convergence duration T (paper: 3)
-        limit: bound threshold eta (paper: 0.05)
-        batch_size: RL batch size (paper: 50)
-        lr: RL learning rate (paper: 1e-4)
-        seed: random seed
-    """
+    """Run RFPAR classification attack — faithful to reference main_cls.py."""
     torch.manual_seed(seed)
     np.random.seed(seed)
-
     t0 = time.time()
+
     N, C, H, W = images.shape
     n_pixels = max(1, int((H + W) / 2 * alpha))
 
@@ -113,112 +142,128 @@ def run_classification_attack(
     adv_dir.mkdir(parents=True, exist_ok=True)
     delta_dir.mkdir(parents=True, exist_ok=True)
 
-    env = ClassificationEnv(model, device, n_pixels)
-    train_data = MyDataset(images.clone().to(device), labels.to(device))
+    model.eval()
+    train_data = _Dataset(images.clone().to(device), labels.to(device))
 
     update_images = images.clone().to(device)
     metric_images = images.clone().to(device)
     idx_list = torch.arange(N, device=device)
     init_ori_prob: list[torch.Tensor] = []
+    ori_prob = None
 
     total_deceived = 0
-    all_iterations: list[int] = []
-    all_l0: list[float] = []
-    all_l2: list[float] = []
+    L0: list[float] = []
+    L2: list[float] = []
+    it_list: list[int] = []
     query_count = 0
     save_labels = torch.zeros(N)
+    i = 0
 
     logger.info(
         f"[RFPAR-CLS] N={N}, pixels={n_pixels}, alpha={alpha}, "
-        f"patience={patience}, limit={limit}, batch_size={batch_size}"
+        f"patience={patience}, limit={limit}, bs={batch_size}"
     )
 
     for p in range(max_iterations):
-        agent = REINFORCEAgent(
-            img_h=H, img_w=W, channels=C, lr=lr, detector_mode=False
-        ).to(device)
+        # Forget: reinitialize agent
+        agent = REINFORCEAgent(H, W, C, lr=lr, detector_mode=False).to(device)
 
         if p != 0:
-            init_ori_prob_t = env.ori_prob - update_rewards
+            init_ori_prob = [ori_prob_full - update_rewards]
         else:
-            init_ori_prob_t = []
+            init_ori_prob = []
 
-        if isinstance(init_ori_prob_t, list):
-            env.ori_prob = init_ori_prob_t
-        else:
-            env.ori_prob = init_ori_prob_t
+        ori_prob_full = (
+            torch.cat(init_ori_prob, 0) if init_ori_prob else torch.tensor([], device=device)
+        )
 
         flag = False
         stop_count = 0
         deceived_count = 0
         succes_list = []
         succes_list_idx = []
-        succes_labels = []
+        succes_labels_list = []
         delta_list = []
         update_rewards = torch.zeros(update_images.shape[0], device=device)
-        init_step = p == 0
-        remember_iter = 0
 
         while True:
             loader = torch.utils.data.DataLoader(
                 train_data, batch_size=batch_size, shuffle=False
             )
-            remember_iter += 1
+            i += 1
 
             train_x_parts = []
             train_y_parts = []
             change_train_x_parts = []
             dip = 0
-            total_rewards_list = []
+            total_rewards_list: list[float] = []
             total_change_list = torch.tensor([], device=device)
+            init_step = len(ori_prob_full) == 0
+
+            batch_ori_probs: list[torch.Tensor] = []
 
             for bt, (s, lbl) in enumerate(loader):
                 s = s.to(device)
                 lbl = lbl.to(device)
 
+                # Forward through agent
                 action_means, action_stds = agent(s)
-                actions, log_probs = sample_actions(action_means, action_stds, n_pixels, device)
+                actions, log_probs = _sample_action(action_means, action_stds, n_pixels, device)
 
                 if n_pixels != 1:
                     actions = actions.view(-1, 5)
                     log_probs = log_probs.sum(axis=0)
 
-                ori_prob_slice = None
-                if not init_step:
+                # Determine ori_prob for this batch
+                if init_step:
+                    # First time: compute original confidence
+                    with torch.no_grad():
+                        orig_out = torch.softmax(
+                            model(_normalize_imagenet(s.float(), device)), dim=1
+                        )
+                        batch_op = orig_out[np.arange(lbl.shape[0]), lbl]
+                        batch_ori_probs.append(batch_op.clone())
+                        ori_prob_batch = batch_op
+                else:
                     start = bt * batch_size
                     end = start + len(lbl)
-                    ori_prob_slice = env.ori_prob[start:end]
+                    ori_prob_batch = ori_prob_full[start:end]
 
-                rewards, change_list, changed_imgs, change_labels = env.step(
-                    s.float(), actions, lbl, init=init_step
-                )
+                # Apply perturbation and get reward
+                changed = _make_transformed_cls(s.float(), actions, n_pixels)
                 query_count += len(lbl)
 
-                if init_step:
-                    if isinstance(init_ori_prob_t, list):
-                        init_ori_prob_t.append(env.ori_prob.clone())
+                with torch.no_grad():
+                    changed_out = torch.softmax(
+                        model(_normalize_imagenet(changed.to(device), device)), dim=1
+                    )
+                    changed_preds_val, changed_preds_idx = torch.max(changed_out, dim=1)
+                    change_list = (lbl != changed_preds_idx).to(device)
+                    rewards = ori_prob_batch - changed_out[np.arange(lbl.shape[0]), lbl]
 
+                # Collect results
                 train_x_parts.append(s[change_list == 0])
                 train_y_parts.append(lbl[change_list == 0])
-                succes_list.append(changed_imgs[change_list == 1])
+                succes_list.append(changed[change_list == 1].to(device))
                 succes_list_idx.append(
-                    idx_list[batch_size * bt : batch_size * bt + batch_size][change_list == 1]
+                    idx_list[batch_size * bt : batch_size * bt + len(lbl)][change_list == 1]
                 )
-                succes_labels.append(change_labels[change_list == 1])
-                all_iterations.extend([remember_iter] * int(change_list.sum().item()))
+                succes_labels_list.append(changed_preds_idx[change_list == 1])
+                it_list.extend([i] * int(change_list.sum().item()))
 
-                change_train_x_parts.append(changed_imgs)
+                change_train_x_parts.append(changed.to(device))
                 total_change_list = torch.cat(
                     (total_change_list, change_list.float()), dim=0
                 ).long()
                 total_rewards_list.extend(rewards.tolist())
-
                 dip += change_list.sum().item()
 
+                # Train RL
                 agent.train_step(log_probs, rewards + change_list.float())
 
-            if init_step and isinstance(init_ori_prob_t, list) and init_ori_prob_t:
-                env.ori_prob = torch.cat(init_ori_prob_t, 0)
+            # After first full pass, set ori_prob_full
+            if init_step and batch_ori_probs:
+                ori_prob_full = torch.cat(batch_ori_probs, 0)
 
             if not train_x_parts or all(t.shape[0] == 0 for t in train_x_parts):
                 break
@@ -229,63 +274,67 @@ def run_classification_attack(
 
             deceived_count += dip
 
+            # Compute metrics for deceived images
             if total_change_list.sum() > 0:
-                for idx_i, val in enumerate(total_change_list):
-                    if val == 1:
-                        all_l0.append(_l0_norm(metric_images[idx_i], change_train_x[idx_i]))
-                        all_l2.append(_l2_norm(metric_images[idx_i], change_train_x[idx_i]))
-                        delta_list.append(abs(metric_images[idx_i] - change_train_x[idx_i]))
+                for idx_i in range(len(total_change_list)):
+                    if total_change_list[idx_i] == 1:
+                        L0.extend(_l0_norm(metric_images[idx_i], change_train_x[idx_i]))
+                        L2.extend(_l2_norm(metric_images[idx_i], change_train_x[idx_i]))
+                        delta_list.append(
+                            abs(metric_images[idx_i] - change_train_x[idx_i])
+                        )
 
-            metric_images = metric_images[total_change_list == 0]
-            idx_list = idx_list[total_change_list == 0]
-            env.ori_prob = env.ori_prob[total_change_list == 0]
-            update_rewards = update_rewards[total_change_list == 0]
-            update_images = update_images[total_change_list == 0]
+            # Prune deceived images from working sets
+            mask = total_change_list == 0
+            metric_images = metric_images[mask]
+            change_train_x = change_train_x[mask]
+            idx_list = idx_list[mask]
+            ori_prob_full = ori_prob_full[mask]
 
+            # Memory update
+            update_rewards = update_rewards[mask]
+            update_images = update_images[mask]
             standard = update_rewards.mean()
-            total_rewards_t = torch.tensor(total_rewards_list, device=device)[
-                total_change_list == 0
-            ]
 
-            stacked_rewards = torch.stack(
-                [update_rewards, total_rewards_t], dim=0
-            )
-            best_idx = torch.max(stacked_rewards, axis=0).indices
-            update_rewards = stacked_rewards[best_idx, torch.arange(total_rewards_t.shape[0])]
+            total_rewards_t = torch.tensor(total_rewards_list, device=device)[mask]
+            stacked = torch.stack([update_rewards, total_rewards_t], dim=0)
+            best_idx = torch.max(stacked, axis=0).indices
+            arange = torch.arange(total_rewards_t.shape[0])
+            update_rewards = stacked[best_idx, arange]
 
-            change_train_x_remaining = change_train_x[total_change_list == 0]
-            stacked_imgs = torch.stack([update_images, change_train_x_remaining], dim=0)
-            update_images = stacked_imgs[best_idx, torch.arange(total_rewards_t.shape[0])]
+            update_rewards_sum = update_rewards.mean() + total_change_list.sum()
 
-            update_sum = update_rewards.mean() + total_change_list.sum()
-            delta = (
-                ((update_sum - standard) / (standard + 1e-8)).item()
-                if standard.abs() > 1e-8
-                else update_sum.item()
-            )
-            stop_count, flag = _early_stopping(delta, stop_count, limit, patience)
+            stacked_imgs = torch.stack([update_images, change_train_x], dim=0)
+            update_images = stacked_imgs[best_idx, arange]
+
+            # Convergence check
+            delta_val = ((update_rewards_sum - standard) / (standard + 1e-8)).item()
+            stop_count, flag = _early_stopping(delta_val, stop_count, limit, patience)
 
             if flag:
-                train_data = MyDataset(update_images, train_y)
+                train_data = _Dataset(update_images, train_y)
                 break
             else:
-                train_data = MyDataset(train_x, train_y)
-                init_step = False
+                train_data = _Dataset(train_x, train_y)
 
         total_deceived += deceived_count
 
-        if succes_list:
-            all_succ = torch.cat(succes_list, 0)
-            all_succ_idx = torch.cat(succes_list_idx, 0)
-            all_succ_labels = torch.cat(succes_labels, 0)
+        # Save adversarial images
+        nonempty_succ = [s for s in succes_list if s.numel() > 0]
+        nonempty_idx = [s for s in succes_list_idx if s.numel() > 0]
+        nonempty_labels = [s for s in succes_labels_list if s.numel() > 0]
+        if nonempty_succ:
+            all_succ = torch.cat(nonempty_succ, 0)
+            all_idx = torch.cat(nonempty_idx, 0)
+            all_labels = torch.cat(nonempty_labels, 0)
 
-            for n, changed_image in enumerate(all_succ):
+            for n in range(len(all_succ)):
+                img_idx = int(all_idx[n])
                 img = Image.fromarray(
-                    (changed_image.permute(1, 2, 0).cpu().numpy() * 255).astype("uint8")
+                    (all_succ[n].permute(1, 2, 0).cpu().numpy() * 255).astype("uint8")
                 )
-                img_idx = int(all_succ_idx[n])
                 img.save(adv_dir / f"adv_{img_idx:04d}.png")
-                save_labels[img_idx] = all_succ_labels[n].item()
+                save_labels[img_idx] = all_labels[n].item()
 
                 if n < len(delta_list):
                     d = Image.fromarray(
@@ -308,8 +357,8 @@ def run_classification_attack(
         total_images=N,
         total_deceived=total_deceived,
         success_rate=total_deceived / N if N > 0 else 0.0,
-        mean_l0=float(np.mean(all_l0)) if all_l0 else 0.0,
-        mean_l2=float(np.mean(all_l2)) if all_l2 else 0.0,
+        mean_l0=float(np.mean(L0)) if L0 else 0.0,
+        mean_l2=float(np.mean(L2)) if L2 else 0.0,
         mean_queries=query_count / N if N > 0 else 0.0,
         forget_iterations=p + 1,
         elapsed_sec=elapsed,
@@ -321,6 +370,34 @@ def run_classification_attack(
 
     logger.info(f"[RFPAR-CLS] Done: {metrics.success_rate:.1%} success, {elapsed:.1f}s")
     return AttackResult(metrics=metrics, agent_state=agent.state_dict())
+
+
+def _make_transformed_det(original_images, actions, n_pixels):
+    """Apply pixel perturbations for detection (values 0 or 255)."""
+    dev = original_images.device
+    B, C, H, W = original_images.shape
+    actions = torch.sigmoid(actions)
+    x = (actions[:, 0] * H - 1).long().clamp(0, H - 1)
+    y = (actions[:, 1] * W - 1).long().clamp(0, W - 1)
+    r = (actions[:, 2] > 0.5).float() * 255
+    g = (actions[:, 3] > 0.5).float() * 255
+    b = (actions[:, 4] > 0.5).float() * 255
+
+    arr = []
+    for i in range(B):
+        changed = original_images[i].clone()
+        if n_pixels == 1:
+            changed[0, x[i], y[i]] = r[i].to(torch.uint8).float()
+            changed[1, x[i], y[i]] = g[i].to(torch.uint8).float()
+            changed[2, x[i], y[i]] = b[i].to(torch.uint8).float()
+        else:
+            idx = (torch.arange(n_pixels, device=dev) * B + i)
+            idx = idx[idx < len(x)]
+            changed[0, x[idx], y[idx]] = r[idx].to(torch.uint8).float()
+            changed[1, x[idx], y[idx]] = g[idx].to(torch.uint8).float()
+            changed[2, x[idx], y[idx]] = b[idx].to(torch.uint8).float()
+        arr.append(changed.unsqueeze(0))
+    return torch.cat(arr, 0)
 
 
 def run_detection_attack(
@@ -338,19 +415,7 @@ def run_detection_attack(
     conf: float = 0.50,
     seed: int = 2,
 ) -> AttackResult:
-    """Run RFPAR object detection attack (YOLO).
-
-    Args:
-        model: YOLO model instance
-        images: list of (H, W, 3) uint8 numpy arrays
-        hw_array: (N, 2) actual heights/widths
-        device: CUDA device
-        output_dir: save adversarial images here
-        max_iterations: max Forget iterations
-        alpha: pixel ratio (paper: 0.05 for detection)
-        patience: convergence duration T (paper: 20)
-    """
-    import math
+    """Run RFPAR detection attack — faithful to reference main_od.py."""
     import torchvision.transforms as transforms
 
     torch.manual_seed(seed)
@@ -358,8 +423,8 @@ def run_detection_attack(
     t0 = time.time()
 
     N = len(images)
-    h_max, w_max = hw_array.max(axis=0)
-    shape_unity = (hw_array[:, 0] == h_max).all() and (hw_array[:, 1] == w_max).all()
+    h_max, w_max = int(hw_array.max(axis=0)[0]), int(hw_array.max(axis=0)[1])
+    shape_unity = bool((hw_array[:, 0] == h_max).all() and (hw_array[:, 1] == w_max).all())
     n_pixels = max(1, int((h_max + w_max) / 2 * alpha))
 
     adv_dir = output_dir / "adv_images"
@@ -367,13 +432,11 @@ def run_detection_attack(
     adv_dir.mkdir(parents=True, exist_ok=True)
     delta_dir.mkdir(parents=True, exist_ok=True)
 
-    env = DetectionEnv(model, device, n_pixels, conf)
-
     if not shape_unity:
-        for i in range(N):
-            images[i] = np.pad(
-                images[i],
-                ((0, h_max - hw_array[i, 0]), (0, w_max - hw_array[i, 1]), (0, 0)),
+        for idx in range(N):
+            images[idx] = np.pad(
+                images[idx],
+                ((0, h_max - hw_array[idx, 0]), (0, w_max - hw_array[idx, 1]), (0, 0)),
                 "constant",
             )
 
@@ -382,18 +445,18 @@ def run_detection_attack(
         f"shape_unity={shape_unity}, patience={patience}"
     )
 
-    # Get initial detection results
+    # Get initial detections
+    ori_prob_list = []
+    ori_cls_list = []
+    ori_box_num = []
     for n, img in enumerate(images):
-        if shape_unity:
-            results = model(img, conf=conf, verbose=False)
-        else:
-            results = model(img[: hw_array[n, 0], : hw_array[n, 1]], conf=conf, verbose=False)
-        env.ori_prob.append(results[0].boxes.conf)
-        env.ori_cls.append(results[0].boxes.cls)
-        env.ori_box_num.append(results[0].boxes.shape[0])
+        target = img if shape_unity else img[: hw_array[n, 0], : hw_array[n, 1]]
+        results = model(target, conf=conf, verbose=False)
+        ori_prob_list.append(results[0].boxes.conf)
+        ori_cls_list.append(results[0].boxes.cls)
+        ori_box_num.append(results[0].boxes.shape[0])
 
-    env.ori_box_num_t = torch.tensor(env.ori_box_num).long()
-    avg_boxes = env.ori_box_num_t.float().mean().item()
+    avg_boxes = float(np.mean(ori_box_num))
     logger.info(f"Average detected objects: {avg_boxes:.1f}")
 
     update_images = torch.tensor(np.array(images), device=device).clone()
@@ -403,72 +466,122 @@ def run_detection_attack(
     torchvision_transform = transforms.Compose(
         [transforms.Resize((256, 256)), transforms.CenterCrop(224)]
     )
-    trick_element = torch.zeros(N)
-    train_data = MyDataset(torch.tensor(np.array(images)), trick_element)
+    train_data = _Dataset(torch.tensor(np.array(images)), torch.zeros(N))
 
     it = 0
     iteration = torch.zeros(N, device=device)
     box_count = torch.zeros(N)
-    all_l0: list[float] = []
-    all_l2: list[float] = []
     query_count = 0
 
     for p in range(max_iterations):
-        agent = REINFORCEAgent(
-            img_h=224, img_w=224, channels=3, lr=lr, detector_mode=True
-        ).to(device)
+        agent = REINFORCEAgent(224, 224, 3, lr=lr, detector_mode=True).to(device)
 
         flag = False
         stop_count = 0
         prev_change_list = torch.zeros(update_images.shape[0], device=device)
         update_rewards = torch.zeros(update_images.shape[0], device=device)
-        need_init = len(env.ori_cls) == 0
+
+        # Current labels/probs for this Forget iteration
+        cur_cls = list(ori_cls_list)
+        cur_prob = list(ori_prob_list)
+        need_init = True
 
         while True:
             bts = math.ceil(train_data.x_data.shape[0] / batch_size)
             change_train_x = []
             it += 1
-            total_rewards_list = []
+            total_rewards_list: list[float] = []
             total_change_list = torch.tensor([], device=device)
 
             for bt in range(bts):
-                if bt != bts - 1:
-                    s = train_data.x_data[bt * batch_size : (bt + 1) * batch_size]
-                else:
-                    s = train_data.x_data[bt * batch_size :]
+                start = bt * batch_size
+                end = min(start + batch_size, train_data.x_data.shape[0])
+                s = train_data.x_data[start:end]
 
                 if not need_init:
-                    labels = env.ori_cls[bt * batch_size : bt * batch_size + len(s)]
-                    probs = env.ori_prob[bt * batch_size : bt * batch_size + len(s)]
-                else:
-                    labels = None
-                    probs = None
+                    labels = cur_cls[start:end]
+                    probs = cur_prob[start:end]
 
                 s_perm = s.permute(0, 3, 1, 2).float()
                 s_norm = torchvision_transform(s_perm.to(device)) / 255
                 action_means, action_stds = agent(s_norm)
-                actions, log_probs = sample_actions(
-                    action_means, action_stds, n_pixels, device
-                )
+                actions, log_probs = _sample_action(action_means, action_stds, n_pixels, device)
 
                 if n_pixels != 1:
                     actions = actions.view(-1, 5)
                     log_probs = log_probs.sum(axis=0)
 
-                rewards, dif_list, changed_np = env.step(
-                    s_perm, actions, bt, init=need_init, labels=labels, probs=probs
-                )
+                changed = _make_transformed_det(s_perm.to(device), actions, n_pixels)
                 query_count += len(s)
+
+                with torch.no_grad():
+                    if need_init:
+                        labels = []
+                        probs = []
+                        for img_t in s_perm:
+                            res = model(
+                                img_t.cpu().numpy().transpose(1, 2, 0),
+                                conf=conf, verbose=False,
+                            )
+                            probs.append(res[0].boxes.conf)
+                            labels.append(res[0].boxes.cls)
+                        cur_prob[start:end] = probs
+                        cur_cls[start:end] = labels
+
+                    changed_np = changed.cpu().numpy().transpose(0, 2, 3, 1)
+                    prob_list = []
+                    cls_list = []
+                    for img_np in changed_np:
+                        res = model(img_np, conf=conf, verbose=False)
+                        prob_list.append(res[0].boxes.conf)
+                        cls_list.append(res[0].boxes.cls)
+
+                    # Compute rewards (box count change + confidence diff)
+                    rewards = []
+                    dif_list = []
+                    for ii in range(len(cls_list)):
+                        sz = max(
+                            torch.bincount(labels[ii].long()).shape[0] if labels[ii].numel() > 0 else 1,
+                            torch.bincount(cls_list[ii].long()).shape[0] if cls_list[ii].numel() > 0 else 1,
+                        )
+                        orig_bc = torch.bincount(labels[ii].long(), minlength=sz) if labels[ii].numel() > 0 else torch.zeros(sz)
+                        new_bc = torch.bincount(cls_list[ii].long(), minlength=sz) if cls_list[ii].numel() > 0 else torch.zeros(sz)
+                        temp = orig_bc - new_bc
+                        dif = temp.sum()
+                        dif_list.append(dif)
+
+                        # Match labels/probs for reward
+                        lab_i = labels[ii].clone()
+                        prob_i = probs[ii].clone()
+                        cls_i = cls_list[ii].clone()
+                        plist_i = prob_list[ii].clone()
+
+                        if (temp != 0).any():
+                            for j in range(len(temp)):
+                                if temp[j] > 0:
+                                    add = torch.full((int(temp[j]),), j, dtype=torch.long, device=device)
+                                    cls_i = torch.cat((cls_i.long().to(device), add))
+                                    plist_i = torch.cat((plist_i.to(device), torch.zeros(int(temp[j]), device=device)))
+                                elif temp[j] < 0:
+                                    add = torch.full((int(-temp[j]),), j, dtype=torch.long, device=device)
+                                    lab_i = torch.cat((lab_i.long().to(device), add))
+                                    prob_i = torch.cat((prob_i.to(device), torch.zeros(int(-temp[j]), device=device)))
+
+                        reward = (
+                            prob_i[lab_i.sort()[1]].cpu() - plist_i[cls_i.sort()[1]].cpu()
+                        ).sum() + dif
+                        rewards.append(reward)
+
+                rewards_t = torch.tensor(rewards, device=device)
 
                 for img_np in changed_np:
                     change_train_x.append(img_np)
-
                 total_change_list = torch.cat(
-                    (total_change_list, dif_list.to(device).float()), dim=0
+                    (total_change_list, torch.tensor(dif_list, device=device).float()), dim=0
                 ).long()
-                total_rewards_list.extend(rewards.tolist())
+                total_rewards_list.extend(rewards_t.tolist())
 
-                agent.train_step(log_probs, rewards)
+                agent.train_step(log_probs, rewards_t)
 
             need_init = False
 
@@ -478,11 +591,12 @@ def run_detection_attack(
 
             stacked = torch.stack([update_rewards, total_rewards_t], dim=0)
             best_idx = torch.max(stacked, axis=0).indices
-            update_rewards = stacked[best_idx, torch.arange(len(total_rewards_t))]
+            arange = torch.arange(len(total_rewards_t))
+            update_rewards = stacked[best_idx, arange]
 
             change_t = torch.tensor(np.array(change_train_x), device=device)
             stacked_imgs = torch.stack([update_images, change_t], dim=0)
-            update_images = stacked_imgs[best_idx, torch.arange(len(total_rewards_t))]
+            update_images = stacked_imgs[best_idx, arange]
 
             temp = torch.max(
                 torch.stack([prev_change_list, total_change_list.float()], dim=0), axis=0
@@ -491,11 +605,10 @@ def run_detection_attack(
             prev_change_list = temp.clone()
 
             if delta_box.sum() > 0:
-                change_idx = [i for i in range(len(delta_box)) if delta_box[i] > 0]
-                for ci in change_idx:
-                    yolo_list[ci] = torch.tensor(change_train_x[ci])
-                    iteration[ci] = it
-
+                for ci in range(len(delta_box)):
+                    if delta_box[ci] > 0:
+                        yolo_list[ci] = torch.tensor(change_train_x[ci])
+                        iteration[ci] = it
             box_count += delta_box
 
             update_sum = update_rewards.mean()
@@ -505,20 +618,24 @@ def run_detection_attack(
             stop_count, flag = _early_stopping(delta_val, stop_count, limit, patience)
 
             if flag:
-                env.ori_cls = []
-                env.ori_prob = []
-                train_data = MyDataset(update_images.cpu(), torch.zeros(len(update_images)))
-                it += 1
+                # Re-detect for next Forget iteration
+                ori_cls_list = []
+                ori_prob_list = []
+                for ci in range(update_images.shape[0]):
+                    img_np = update_images[ci].cpu().numpy()
+                    res = model(img_np, conf=conf, verbose=False)
+                    ori_prob_list.append(res[0].boxes.conf)
+                    ori_cls_list.append(res[0].boxes.cls)
+                train_data = _Dataset(update_images.cpu(), torch.zeros(len(update_images)))
                 break
             else:
-                env.ori_cls = []
-                env.ori_prob = []
-                # Re-detect for next iteration
-                for n_i in range(len(change_train_x)):
-                    img_i = change_train_x[n_i]
-                    res = model(img_i, conf=conf, verbose=False)
-                    env.ori_prob.append(res[0].boxes.conf)
-                    env.ori_cls.append(res[0].boxes.cls)
+                # Re-detect current images
+                cur_cls = []
+                cur_prob = []
+                for ci in range(len(change_train_x)):
+                    res = model(change_train_x[ci], conf=conf, verbose=False)
+                    cur_prob.append(res[0].boxes.conf)
+                    cur_cls.append(res[0].boxes.cls)
 
         total_elim = box_count.mean().item()
         logger.info(f"Forget:{p + 1}, eliminated_boxes_avg={total_elim:.1f}")
@@ -527,20 +644,26 @@ def run_detection_attack(
             logger.info("All objects eliminated")
             break
 
-    # Compute metrics
-    for i in range(N):
-        all_l0.append(_l0_norm(metric_images[i], yolo_list[i]))
-        all_l2.append(_l2_norm(metric_images[i].float(), yolo_list[i].float()))
+    # Compute final metrics
+    L0: list[float] = []
+    L2: list[float] = []
+    for idx in range(N):
+        if shape_unity:
+            L0.extend(_l0_norm(metric_images[idx], yolo_list[idx]))
+            L2.extend(_l2_norm(metric_images[idx].float(), yolo_list[idx].float()))
+        else:
+            h, w = hw_array[idx, 0], hw_array[idx, 1]
+            L0.extend(_l0_norm(metric_images[idx, :h, :w], yolo_list[idx, :h, :w]))
+            L2.extend(_l2_norm(metric_images[idx, :h, :w].float(), yolo_list[idx, :h, :w].float()))
 
     # Save adversarial images
-    for i in range(N):
+    for idx in range(N):
         if shape_unity:
-            img = Image.fromarray(yolo_list[i].numpy().astype("uint8"))
+            img = Image.fromarray(yolo_list[idx].numpy().astype("uint8"))
         else:
-            img = Image.fromarray(
-                yolo_list[i, : hw_array[i, 0], : hw_array[i, 1]].numpy().astype("uint8")
-            )
-        img.save(adv_dir / f"adv_{i + 1:04d}.png")
+            h, w = hw_array[idx, 0], hw_array[idx, 1]
+            img = Image.fromarray(yolo_list[idx, :h, :w].numpy().astype("uint8"))
+        img.save(adv_dir / f"adv_{idx + 1:04d}.png")
 
     elapsed = time.time() - t0
     metrics = AttackMetrics(
@@ -548,8 +671,8 @@ def run_detection_attack(
         total_images=N,
         total_deceived=int(box_count.sum().item()),
         success_rate=total_elim / avg_boxes if avg_boxes > 0 else 0.0,
-        mean_l0=float(np.mean(all_l0)) if all_l0 else 0.0,
-        mean_l2=float(np.mean(all_l2)) if all_l2 else 0.0,
+        mean_l0=float(np.mean(L0)) if L0 else 0.0,
+        mean_l2=float(np.mean(L2)) if L2 else 0.0,
         mean_queries=query_count / N if N > 0 else 0.0,
         forget_iterations=p + 1,
         elapsed_sec=elapsed,

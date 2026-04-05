@@ -85,9 +85,13 @@ class ClassificationEnv:
         images: torch.Tensor,
         actions: torch.Tensor,
         labels: torch.Tensor,
+        ori_prob: torch.Tensor | None = None,
         init: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Execute one attack step.
+
+        Args:
+            ori_prob: original confidence for this batch (used when not init)
 
         Returns: (rewards, change_list, changed_images, changed_preds)
         """
@@ -99,6 +103,7 @@ class ClassificationEnv:
                 self.model(normalize_imagenet(images.to(self.device), self.device)), dim=1
             )
             self.ori_prob = orig_out[np.arange(labels.shape[0]), labels].clone()
+            ori_prob = self.ori_prob
 
         changed_out = torch.softmax(
             self.model(normalize_imagenet(changed.to(self.device), self.device)), dim=1
@@ -106,7 +111,7 @@ class ClassificationEnv:
         changed_preds_val, changed_preds_idx = torch.max(changed_out, dim=1)
 
         change_list = (labels != changed_preds_idx).to(self.device)
-        rewards = self.ori_prob - changed_out[np.arange(labels.shape[0]), labels]
+        rewards = ori_prob - changed_out[np.arange(labels.shape[0]), labels]
 
         return rewards, change_list, changed.to(self.device), changed_preds_idx
 
