@@ -4,7 +4,7 @@ seed = 2
 
 [execution]
 backend = "cuda"
-mode = "classification"
+mode = "detection"
 dry_run = false
 output_dir = "/mnt/artifacts-datai/checkpoints/DEF-rfpar"
 
@@ -17,7 +17,7 @@ argoverse_root = "/mnt/forge-data/datasets/argoverse"
 [attack]
 max_iterations = 100
 bound_threshold_eta = 0.05
-alpha = 0.01
-convergence_duration_t = 3
+alpha = 0.05
+convergence_duration_t = 20
 query_budget = 1700
 yolo_conf_threshold = 0.5

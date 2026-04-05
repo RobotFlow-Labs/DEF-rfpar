@@ -1,27 +1,42 @@
 [project]
 name = "anima-rfpar"
 version = "0.1.0"
-description = "ANIMA scaffold for RFPAR (RL-based black-box pixel attack research module)"
+description = "RFPAR: Remember and Forget Pixel Attack using Reinforcement Learning"
 readme = "PRD.md"
 requires-python = ">=3.11,<3.12"
 dependencies = [
   "numpy>=1.26",
   "pillow>=10.0",
-]
-
-[project.optional-dependencies]
-ml = [
   "torch>=2.3",
   "torchvision>=0.18",
   "ultralytics>=8.2",
+  "safetensors>=0.4",
+  "onnx>=1.15",
 ]
+
+[project.optional-dependencies]
 dev = [
   "pytest>=8.0",
+  "ruff>=0.4",
 ]
+serve = [
+  "fastapi>=0.111",
+  "uvicorn>=0.30",
+]
+
+[project.scripts]
+anima-rfpar = "anima_rfpar.cli:main"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "I", "B", "UP", "N", "C4"]
+
+[tool.uv]
+extra-index-url = ["https://download.pytorch.org/whl/cu128"]
 
 [build-system]
 requires = ["hatchling>=1.24.0"]
