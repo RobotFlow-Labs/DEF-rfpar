@@ -1,0 +1,19 @@
+FROM ghcr.io/robotflow-labs/anima-serve:jazzy AS base
+
+WORKDIR /app
+
+COPY pyproject.toml .
+COPY src/ src/
+COPY configs/ configs/
+
+RUN uv pip install --system -e ".[serve]" --extra-index-url https://download.pytorch.org/whl/cu128
+
+EXPOSE 8080
+
+ENV ANIMA_MODULE_NAME=DEF-rfpar
+ENV ANIMA_SERVE_PORT=8080
+ENV ANIMA_DEVICE=auto
+ENV ANIMA_WEIGHT_FORMAT=auto
+ENV ANIMA_WEIGHT_DIR=/data/weights
+
+CMD ["uvicorn", "anima_rfpar.service.app:app", "--host", "0.0.0.0", "--port", "8080"]

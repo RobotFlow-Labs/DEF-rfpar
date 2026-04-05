@@ -540,12 +540,14 @@ def run_detection_attack(
                     rewards = []
                     dif_list = []
                     for ii in range(len(cls_list)):
+                        lab_cpu = labels[ii].long().cpu()
+                        cls_cpu = cls_list[ii].long().cpu()
                         sz = max(
-                            torch.bincount(labels[ii].long()).shape[0] if labels[ii].numel() > 0 else 1,
-                            torch.bincount(cls_list[ii].long()).shape[0] if cls_list[ii].numel() > 0 else 1,
+                            torch.bincount(lab_cpu).shape[0] if lab_cpu.numel() > 0 else 1,
+                            torch.bincount(cls_cpu).shape[0] if cls_cpu.numel() > 0 else 1,
                         )
-                        orig_bc = torch.bincount(labels[ii].long(), minlength=sz) if labels[ii].numel() > 0 else torch.zeros(sz)
-                        new_bc = torch.bincount(cls_list[ii].long(), minlength=sz) if cls_list[ii].numel() > 0 else torch.zeros(sz)
+                        orig_bc = torch.bincount(lab_cpu, minlength=sz) if lab_cpu.numel() > 0 else torch.zeros(sz)
+                        new_bc = torch.bincount(cls_cpu, minlength=sz) if cls_cpu.numel() > 0 else torch.zeros(sz)
                         temp = orig_bc - new_bc
                         dif = temp.sum()
                         dif_list.append(dif)

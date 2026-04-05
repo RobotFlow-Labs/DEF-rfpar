@@ -1,11 +1,38 @@
 id: DEF-rfpar
-name: Remember and Forget Pixel Attack using RL
+name: "RFPAR: Remember and Forget Pixel Attack using RL"
 version: 0.1.0
+paper: "ArXiv 2502.07821"
+domain: adversarial-attacks
+product_stack: [ATLAS, ORACLE]
+
 runtime:
   python: "3.11"
-  entrypoint: "python -m anima_rfpar.cli"
-interfaces:
-  inputs: []
-  outputs: []
-notes:
-  - "Scaffold manifest; populate ROS2/API interface contracts in PRD-06."
+  entrypoint: "python -m anima_rfpar.train"
+
+capabilities:
+  - classification_attack
+  - detection_attack
+  - pixel_perturbation
+
+api:
+  health: /health
+  ready: /ready
+  info: /info
+  predict: /predict
+
+docker:
+  image: anima-rfpar
+  base: "ghcr.io/robotflow-labs/anima-serve:jazzy"
+  port: 8080
+  gpu: true
+
+ros2:
+  package: anima_rfpar
+  node: rfpar_node
+  topics:
+    input: /rfpar/image_input
+    output: /rfpar/perturbation_output
+
+weights:
+  format_priority: [trt, onnx, safetensors, pth]
+  hf_repo: ilessio-aiflowlab/DEF-rfpar
