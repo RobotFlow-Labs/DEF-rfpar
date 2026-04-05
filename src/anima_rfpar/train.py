@@ -88,15 +88,16 @@ def _load_classifier(device: torch.device) -> torch.nn.Module:
 
 
 def _load_detector(model_path: str | None = None):
-    """Load YOLO detector."""
+    """Load YOLO detector. Paper uses YOLOv8n — prioritize that."""
     from ultralytics import YOLO
 
     if model_path and Path(model_path).exists():
         model = YOLO(model_path)
+    elif Path("repositories/RFPAR/yolov8n.pt").exists():
+        # Paper's exact model
+        model = YOLO("repositories/RFPAR/yolov8n.pt")
     elif Path("/mnt/forge-data/models/yolo11n.pt").exists():
         model = YOLO("/mnt/forge-data/models/yolo11n.pt")
-    elif Path("repositories/RFPAR/yolov8n.pt").exists():
-        model = YOLO("repositories/RFPAR/yolov8n.pt")
     else:
         model = YOLO("yolov8n.pt")
 

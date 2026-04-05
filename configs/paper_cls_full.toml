@@ -1,0 +1,28 @@
+# Paper-exact classification config
+# ImageNet-1K subset (200 images from reference repo)
+# Victim: ResNeXt50_32x4d
+# Paper Section 3.1: alpha=0.01, T=3, eta=0.05, max_iter=100
+
+[module]
+name = "DEF-rfpar"
+seed = 2
+
+[execution]
+backend = "cuda"
+mode = "classification"
+dry_run = false
+output_dir = "/mnt/artifacts-datai/checkpoints/DEF-rfpar/cls_full"
+
+[paths]
+reference_repo = "repositories/RFPAR"
+imagenet_root = "repositories/RFPAR/ImageNet"
+coco_root = "/mnt/forge-data/datasets/coco/val2017"
+argoverse_root = "/mnt/forge-data/datasets/argoverse2/motion-forecasting"
+
+[attack]
+max_iterations = 100
+bound_threshold_eta = 0.05
+alpha = 0.01
+convergence_duration_t = 3
+query_budget = 2000
+yolo_conf_threshold = 0.5

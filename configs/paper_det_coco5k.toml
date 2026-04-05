@@ -1,0 +1,29 @@
+# Paper-exact detection config — COCO val2017 (5000 images)
+# Victim: YOLOv8n (paper model)
+# Paper Section 3.3: alpha=0.05, T=20, eta=0.05
+# Note: full 100 iterations on 5000 images would take days
+# Using max_iterations=15 for practical evaluation on L4
+
+[module]
+name = "DEF-rfpar"
+seed = 2
+
+[execution]
+backend = "cuda"
+mode = "detection"
+dry_run = false
+output_dir = "/mnt/artifacts-datai/checkpoints/DEF-rfpar/det_coco5k"
+
+[paths]
+reference_repo = "repositories/RFPAR"
+imagenet_root = "repositories/RFPAR/ImageNet"
+coco_root = "/mnt/forge-data/datasets/coco/val2017"
+argoverse_root = "/mnt/forge-data/datasets/argoverse2/motion-forecasting"
+
+[attack]
+max_iterations = 15
+bound_threshold_eta = 0.05
+alpha = 0.05
+convergence_duration_t = 20
+query_budget = 2000
+yolo_conf_threshold = 0.5
