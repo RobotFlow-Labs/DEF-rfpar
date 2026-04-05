@@ -1,10 +1,45 @@
-version: '3.9'
+version: "3.8"
+
 services:
-  anima-rfpar:
+  rfpar-serve:
     build:
       context: .
-      dockerfile: docker/Dockerfile.serve
-    env_file:
-      - .env.serve.example
+      dockerfile: Dockerfile.serve
+    profiles: ["serve"]
     ports:
-      - "8000:8000"
+      - "${ANIMA_SERVE_PORT:-8080}:8080"
+    volumes:
+      - ${ANIMA_WEIGHT_DIR:-./weights}:/data/weights:ro
+    env_file: .env.serve
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    network_mode: host
+    restart: unless-stopped
+
+  rfpar-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.serve
+    profiles: ["api"]
+    ports:
+      - "${ANIMA_SERVE_PORT:-8080}:8080"
+    volumes:
+      - ${ANIMA_WEIGHT_DIR:-./weights}:/data/weights:ro
+    environment:
+      - ANIMA_MODULE_NAME=DEF-rfpar
+      - ANIMA_DEVICE=cpu
+    restart: unless-stopped
+
+  rfpar-test:
+    build:
+      context: .
+      dockerfile: Dockerfile.serve
+    profiles: ["test"]
+    command: ["python", "-m", "pytest", "tests/", "-x", "-v"]
+    volumes:
+      - ./tests:/app/tests:ro
