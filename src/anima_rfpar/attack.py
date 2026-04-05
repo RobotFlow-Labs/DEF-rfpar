@@ -19,6 +19,7 @@ import torch.distributions as dist
 from PIL import Image
 
 from .agent import REINFORCEAgent
+from .cuda_ops import apply_perturbations_cuda, batch_reward
 
 logger = logging.getLogger(__name__)
 
@@ -82,31 +83,10 @@ def _sample_action(means, stds, n_pixels, device):
 
 
 def _make_transformed_cls(original_images, actions, n_pixels):
-    """Apply pixel perturbations for classification (values in [0,1])."""
-    dev = original_images.device
-    B, C, H, W = original_images.shape
-    actions = torch.sigmoid(actions)
-    x = (actions[:, 0] * H - 1).long().clamp(0, H - 1)
-    y = (actions[:, 1] * W - 1).long().clamp(0, W - 1)
-    r = (actions[:, 2] > 0.5).float()
-    g = (actions[:, 3] > 0.5).float()
-    b = (actions[:, 4] > 0.5).float()
-
-    arr = []
-    for i in range(B):
-        changed = original_images[i].clone()
-        if n_pixels == 1:
-            changed[0, x[i], y[i]] = r[i]
-            changed[1, x[i], y[i]] = g[i]
-            changed[2, x[i], y[i]] = b[i]
-        else:
-            idx = (torch.arange(n_pixels, device=dev) * B + i)
-            idx = idx[idx < len(x)]
-            changed[0, x[idx], y[idx]] = r[idx]
-            changed[1, x[idx], y[idx]] = g[idx]
-            changed[2, x[idx], y[idx]] = b[idx]
-        arr.append(changed.unsqueeze(0))
-    return torch.cat(arr, 0)
+    """Apply pixel perturbations for classification (values in [0,1]).
+    Uses CUDA-accelerated apply_perturbations_cuda.
+    """
+    return apply_perturbations_cuda(original_images, actions, n_pixels, detector_mode=False)
 
 
 class _Dataset(torch.utils.data.Dataset):
@@ -245,7 +225,8 @@ def run_classification_attack(
                     )
                     changed_preds_val, changed_preds_idx = torch.max(changed_out, dim=1)
                     change_list = (lbl != changed_preds_idx).to(device)
-                    rewards = ori_prob_batch - changed_out[np.arange(lbl.shape[0]), lbl]
+                    changed_conf = changed_out[np.arange(lbl.shape[0]), lbl]
+                    rewards = batch_reward(ori_prob_batch, changed_conf)
 
                 # Collect results
                 train_x_parts.append(s[change_list == 0])
@@ -378,31 +359,10 @@ def run_classification_attack(
 
 
 def _make_transformed_det(original_images, actions, n_pixels):
-    """Apply pixel perturbations for detection (values 0 or 255)."""
-    dev = original_images.device
-    B, C, H, W = original_images.shape
-    actions = torch.sigmoid(actions)
-    x = (actions[:, 0] * H - 1).long().clamp(0, H - 1)
-    y = (actions[:, 1] * W - 1).long().clamp(0, W - 1)
-    r = (actions[:, 2] > 0.5).float() * 255
-    g = (actions[:, 3] > 0.5).float() * 255
-    b = (actions[:, 4] > 0.5).float() * 255
-
-    arr = []
-    for i in range(B):
-        changed = original_images[i].clone()
-        if n_pixels == 1:
-            changed[0, x[i], y[i]] = r[i].to(torch.uint8).float()
-            changed[1, x[i], y[i]] = g[i].to(torch.uint8).float()
-            changed[2, x[i], y[i]] = b[i].to(torch.uint8).float()
-        else:
-            idx = (torch.arange(n_pixels, device=dev) * B + i)
-            idx = idx[idx < len(x)]
-            changed[0, x[idx], y[idx]] = r[idx].to(torch.uint8).float()
-            changed[1, x[idx], y[idx]] = g[idx].to(torch.uint8).float()
-            changed[2, x[idx], y[idx]] = b[idx].to(torch.uint8).float()
-        arr.append(changed.unsqueeze(0))
-    return torch.cat(arr, 0)
+    """Apply pixel perturbations for detection (values 0 or 255).
+    Uses CUDA-accelerated apply_perturbations_cuda.
+    """
+    return apply_perturbations_cuda(original_images, actions, n_pixels, detector_mode=True)
 
 
 def run_detection_attack(
@@ -437,6 +397,11 @@ def run_detection_attack(
     adv_dir.mkdir(parents=True, exist_ok=True)
     delta_dir.mkdir(parents=True, exist_ok=True)
 
+    # Ensure all images are 3-channel
+    for idx in range(N):
+        if images[idx].ndim == 2:
+            images[idx] = np.stack([images[idx]] * 3, axis=-1)
+
     if not shape_unity:
         for idx in range(N):
             images[idx] = np.pad(
@@ -464,7 +429,8 @@ def run_detection_attack(
     avg_boxes = float(np.mean(ori_box_num))
     logger.info(f"Average detected objects: {avg_boxes:.1f}")
 
-    update_images = torch.tensor(np.array(images), device=device).clone()
+    # Keep large image tensors on CPU to avoid GPU OOM on large datasets
+    update_images = torch.tensor(np.array(images)).clone()
     metric_images = torch.tensor(np.array(images)).clone()
     yolo_list = torch.tensor(np.array(images)).clone()
 
@@ -611,12 +577,15 @@ def run_detection_attack(
 
             stacked = torch.stack([update_rewards, total_rewards_t], dim=0)
             best_idx = torch.max(stacked, axis=0).indices
-            arange = torch.arange(len(total_rewards_t))
-            update_rewards = stacked[best_idx, arange]
+            n_remaining = len(total_rewards_t)
+            arange_dev = torch.arange(n_remaining, device=device)
+            update_rewards = stacked[best_idx, arange_dev]
 
-            change_t = torch.tensor(np.array(change_train_x), device=device)
+            # Image memory update on CPU (too large for GPU with 5K images)
+            change_t = torch.tensor(np.array(change_train_x))
             stacked_imgs = torch.stack([update_images, change_t], dim=0)
-            update_images = stacked_imgs[best_idx, arange]
+            arange_cpu = torch.arange(n_remaining)
+            update_images = stacked_imgs[best_idx.cpu(), arange_cpu]
 
             temp = torch.max(
                 torch.stack([prev_change_list, total_change_list.float()], dim=0), axis=0
