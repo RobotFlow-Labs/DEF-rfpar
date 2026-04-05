@@ -6,7 +6,7 @@
 # Domain: RL-based Black-box Pixel Adversarial Attacks on Detection
 # Product Stack: ATLAS / ORACLE
 
-## Status: Running — Classification 85% ASR, Detection in progress
+## Status: Classification DONE (93% ASR), Detection running, Exports DONE, HF pushed
 
 ## Paper Summary
 RFPAR proposes a novel reinforcement learning-based pixel attack method that overcomes randomness in query-based attacks. Unlike patch-based approaches, RFPAR selects individual pixels for perturbation using a one-step RL algorithm. The key innovation is the "Remember and Forget" process: remembering successful pixel perturbations (positive rewards) and forgetting unsuccessful ones (negative rewards). Tested on ImageNet-1K for classification and extends to object detection (YOLOv8, Argoverse dataset). Outperforms state-of-the-art query-based pixel attacks.
