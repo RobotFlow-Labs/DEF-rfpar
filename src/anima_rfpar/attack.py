@@ -408,7 +408,7 @@ def run_detection_attack(
 
     it = 0
     iteration = torch.zeros(N, device=device)
-    box_count = torch.zeros(N, device=device)
+    box_count = torch.zeros(N)
     all_l0: list[float] = []
     all_l2: list[float] = []
     query_count = 0
@@ -422,6 +422,7 @@ def run_detection_attack(
         stop_count = 0
         prev_change_list = torch.zeros(update_images.shape[0], device=device)
         update_rewards = torch.zeros(update_images.shape[0], device=device)
+        need_init = len(env.ori_cls) == 0
 
         while True:
             bts = math.ceil(train_data.x_data.shape[0] / batch_size)
@@ -436,8 +437,12 @@ def run_detection_attack(
                 else:
                     s = train_data.x_data[bt * batch_size :]
 
-                labels = env.ori_cls[bt * batch_size : bt * batch_size + len(s)]
-                probs = env.ori_prob[bt * batch_size : bt * batch_size + len(s)]
+                if not need_init:
+                    labels = env.ori_cls[bt * batch_size : bt * batch_size + len(s)]
+                    probs = env.ori_prob[bt * batch_size : bt * batch_size + len(s)]
+                else:
+                    labels = None
+                    probs = None
 
                 s_perm = s.permute(0, 3, 1, 2).float()
                 s_norm = torchvision_transform(s_perm.to(device)) / 255
@@ -450,10 +455,8 @@ def run_detection_attack(
                     actions = actions.view(-1, 5)
                     log_probs = log_probs.sum(axis=0)
 
-                init_step = p == 0 and it == 1
-
                 rewards, dif_list, changed_np = env.step(
-                    s_perm, actions, bt, init=init_step, labels=labels, probs=probs
+                    s_perm, actions, bt, init=need_init, labels=labels, probs=probs
                 )
                 query_count += len(s)
 
@@ -466,6 +469,8 @@ def run_detection_attack(
                 total_rewards_list.extend(rewards.tolist())
 
                 agent.train_step(log_probs, rewards)
+
+            need_init = False
 
             # Memory update
             standard = update_rewards.mean()
@@ -482,7 +487,7 @@ def run_detection_attack(
             temp = torch.max(
                 torch.stack([prev_change_list, total_change_list.float()], dim=0), axis=0
             ).values
-            delta_box = temp - prev_change_list
+            delta_box = (temp - prev_change_list).cpu()
             prev_change_list = temp.clone()
 
             if delta_box.sum() > 0:
@@ -491,7 +496,7 @@ def run_detection_attack(
                     yolo_list[ci] = torch.tensor(change_train_x[ci])
                     iteration[ci] = it
 
-            box_count += delta_box.cpu()
+            box_count += delta_box
 
             update_sum = update_rewards.mean()
             delta_val = (
